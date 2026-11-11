@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""记住 tmux 里每个 pane 跑的 Claude Code 会话，节点重启后一键全部 resume。
+
+  cc-tmux save             扫描所有 pane，记录 claude 的 sessionId（tmux 状态栏定时调用）
+  cc-tmux list [文件]      查看上一次开机时的快照
+  cc-tmux restore [文件]   按快照重建 tmux 会话/窗口，每个 pane 里 claude --resume
+"""
+import glob, json, os, shutil, socket, subprocess, sys
+
+SESS_DIR = os.path.expanduser('~/.claude/sessions')
+SNAP_DIR = os.path.expanduser('~/.cache/cc-tmux')
+HOST = socket.gethostname().split('.')[0]
+BOOT = open('/proc/sys/kernel/random/boot_id').read().strip()
+
+
+def tmux(*args):
+    return subprocess.run(['tmux', *args], capture_output=True, text=True).stdout.strip()
+
+
+def claude_session(pid, depth=3):
+    """在 pane 的进程树里找 claude，返回它的 ~/.claude/sessions/<pid>.json。"""
+    try:
+        rec = json.load(open(f'{SESS_DIR}/{pid}.json'))
+        start = open(f'/proc/{pid}/stat').read().rsplit(')', 1)[1].split()[19]
+        if rec.get('procStart') == start:  # 排除 pid 复用留下的旧记录
+            return rec
+    except (OSError, ValueError, IndexError):
+        pass
+    if depth == 0:
+        return None
+    try:
+        kids = open(f'/proc/{pid}/task/{pid}/children').read().split()
+    except OSError:
+        return None
+    for kid in kids:
+        if found := claude_session(int(kid), depth - 1):
+            return found
+    return None
+
+
+def save():
+    fmt = '#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_pid}'
+    rows = []
+    for line in tmux('list-panes', '-a', '-F', fmt).splitlines():
+        sess, win, wname, pane, pid = line.split('\t')
+        rec = claude_session(int(pid))
+        if rec:
+            rows.append(dict(session=sess, window=int(win), window_name=wname, pane=int(pane),
+                             cwd=rec['cwd'], session_id=rec['sessionId'], name=rec.get('name', '')))
+    if not rows:
+        return  # 一个 claude 都没有时不覆盖已有快照
+    os.makedirs(SNAP_DIR, exist_ok=True)
+    path = f'{SNAP_DIR}/{HOST}-{BOOT}.json'
+    with open(path + '.tmp', 'w') as f:
+        json.dump(rows, f, ensure_ascii=False, indent=1)
+    os.replace(path + '.tmp', path)
+
+
+def pick(argv):
+    if argv:
+        return argv[0]
+    old = [f for f in glob.glob(f'{SNAP_DIR}/{HOST}-*.json') if BOOT not in f]
+    if not old:
+        sys.exit(f'{SNAP_DIR} 里没有 {HOST} 上一次开机留下的快照')
+    return max(old, key=os.path.getmtime)
+
+
+def show(path):
+    print(path)
+    for r in json.load(open(path)):
+        print(f"{r['session']}:{r['window']}.{r['pane']}  {r['name']}  {r['cwd']}  {r['session_id']}")
+
+
+def restore(path):
+    claude = shutil.which('claude') or 'claude'
+    shell = os.environ.get('SHELL', '/bin/bash')
+    windows, seen = {}, set()
+    rows = sorted(json.load(open(path)), key=lambda r: (r['session'], r['window'], r['pane']))
+    for r in rows:
+        if r['session_id'] in seen:
+            continue
+        seen.add(r['session_id'])
+        cmd = f"{claude} --resume {r['session_id']}; exec {shell}"
+        key = (r['session'], r['window'])
+        if key in windows:
+            tmux('split-window', '-d', '-t', windows[key], '-c', r['cwd'], cmd)
+            tmux('select-layout', '-t', windows[key], 'tiled')
+        elif subprocess.run(['tmux', 'has-session', '-t', f"={r['session']}"],
+                            capture_output=True).returncode:
+            windows[key] = tmux('new-session', '-d', '-P', '-F', '#{window_id}', '-s', r['session'],
+                                '-n', r['window_name'], '-c', r['cwd'], cmd)
+        else:
+            windows[key] = tmux('new-window', '-d', '-P', '-F', '#{window_id}', '-t', f"{r['session']}:",
+                                '-n', r['window_name'], '-c', r['cwd'], cmd)
+        print(f"{r['session']}:{r['window_name']}  {r['name'] or r['session_id']}  ({r['cwd']})")
+    print(f'已恢复 {len(seen)} 个 claude 会话，tmux attach 进去即可')
+
+
+if __name__ == '__main__':
+    cmd, rest = (sys.argv[1], sys.argv[2:]) if len(sys.argv) > 1 else ('', [])
+    if cmd == 'save':
+        save()
+    elif cmd == 'list':
+        show(pick(rest))
+    elif cmd == 'restore':
+        restore(pick(rest))
+    else:
+        sys.exit(__doc__)
